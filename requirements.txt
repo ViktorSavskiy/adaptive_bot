@@ -1,0 +1,8 @@
+pybit
+pandas
+numpy
+scipy
+python-dotenv
+sqlalchemy
+loguru
+openpyxl
