@@ -3,55 +3,67 @@ from .base import BaseStrategy
 
 class BreakoutStrategy(BaseStrategy):
     def check_signal(self):
-        # 1. Проверка глобального тренда (HTF)
+        # 1. Глобальный тренд (HTF) — Пробой торгуем только по направлению рынка
         htf_trend = self.get_htf_trend()
-        if htf_trend == 0: return None
+        if htf_trend == 0: 
+            return None
 
         # 2. Получение данных
         df = self.get_data(limit=100)
-        if df.empty: return None
+        if df.empty or len(df) < 50: 
+            return None
 
-        atr, atr_pct = self.calculate_atr(df)
-        # Сила тренда (регрессия)
-        slope = self.get_trend_strength(df, window=15)
-        current_close = df['close'].iloc[-1]
+        # 3. Параметры (из конфига v9_GoldenRatio или дефолты)
+        vol_mult = self.params.get('breakout_vol', 1.5) # Рекомендуем 1.5 для баланса
+        sl_mult = self.params.get('breakout_sl', 1.0)
+        tp_mult = self.params.get('breakout_tp', 4.0)  # Увеличили тейк для лучшего RR
+
+        atr, _ = self.calculate_atr(df)
+        if atr <= 0: return None
         
-        # 3. Поиск уровней ( window=3 как в твоем коде)
-        res_raw, sup_raw = self.find_levels(df, window=3)
-        res_levels = self.cluster_levels(res_raw, atr_pct)
-        sup_levels = self.cluster_levels(sup_raw, atr_pct)
+        last_close = df['close'].iloc[-1]
+        last_open = df['open'].iloc[-1]
+        
+        # 4. Определение границ канала за последние 30 закрытых свечей
+        lookback = 30
+        channel_high = df['high'].iloc[-(lookback+1):-1].max()
+        channel_low = df['low'].iloc[-(lookback+1):-1].min()
+        
+        # 5. Проверка всплеска объема
+        volume_ok = self.analyze_volume_spike(df, multiplier=vol_mult)
 
-        # --- ЛОГИКА ПРОБОЯ ПО ТВОИМ ПАРАМЕТРАМ ---
+        # --- ЛОГИКА LONG ---
+        if htf_trend == 1:
+            # Условия: Закрылись выше канала, открылись внутри/ниже, цена не улетела слишком далеко (0.5 ATR)
+            if last_close > channel_high and last_open <= channel_high:
+                if last_close <= (channel_high + atr * 0.5) and volume_ok:
+                    
+                    # Стоп ставим чуть ниже пробитого уровня
+                    sl = channel_high - (atr * sl_mult)
+                    tp = last_close + (atr * tp_mult)
+                    
+                    # Защита: стоп должен быть ниже цены входа
+                    if sl < last_close:
+                        return {
+                            'ticker': self.ticker, 'signal': 'long', 'entry': last_close, 
+                            'sl': sl, 'tp': tp, 'atr': atr, 
+                            'strategy': f'breakout_{self.interval}'
+                        }
 
-        # А) LONG (Пробой сопротивления)
-        if slope > 0.2 and htf_trend == 1:
-            for level in res_levels:
-                # 4 касания уровня
-                touches = self.analyze_touches(df, level, 'resistance', atr_pct)
-                if touches >= 4:
-                    # Цена рядом с уровнем (0.2%)
-                    if self.is_price_near(current_close, level):
-                        # Всплеск объема (1.3x)
-                        if self.analyze_volume_spike(df, multiplier=1.3):
-                            return {
-                                'ticker': self.ticker, 'signal': 'long', 'entry': current_close,
-                                'sl': current_close - (2 * atr), # Твоя формула стопа
-                                'tp': current_close + (3 * atr), # Твоя формула тейка
-                                'atr': atr, 'strategy': f'breakout_{self.interval}'
-                            }
-
-        # Б) SHORT (Пробой поддержки)
-        elif slope < -0.2 and htf_trend == -1:
-            for level in sup_levels:
-                touches = self.analyze_touches(df, level, 'support', atr_pct)
-                if touches >= 4:
-                    if self.is_price_near(current_close, level):
-                        if self.analyze_volume_spike(df, multiplier=1.3):
-                            return {
-                                'ticker': self.ticker, 'signal': 'short', 'entry': current_close,
-                                'sl': current_close + (2 * atr),
-                                'tp': current_close - (3 * atr),
-                                'atr': atr, 'strategy': f'breakout_{self.interval}'
-                            }
+        # --- ЛОГИКА SHORT ---
+        elif htf_trend == -1:
+            # Условия: Закрылись ниже канала, открылись внутри/выше
+            if last_close < channel_low and last_open >= channel_low:
+                if last_close >= (channel_low - atr * 0.5) and volume_ok:
+                    
+                    sl = channel_low + (atr * sl_mult)
+                    tp = last_close - (atr * tp_mult)
+                    
+                    if sl > last_close:
+                        return {
+                            'ticker': self.ticker, 'signal': 'short', 'entry': last_close, 
+                            'sl': sl, 'tp': tp, 'atr': atr, 
+                            'strategy': f'breakout_{self.interval}'
+                        }
 
         return None

@@ -1,390 +1,248 @@
+import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from loguru import logger
 
 from .strategies.fakeout import FakeoutStrategy
-from .database import DatabaseManager
 from .strategies.breakout import BreakoutStrategy
 from .strategies.bounce import BounceStrategy
 from .strategies.trend import TrendStrategy
+from .database import DatabaseManager
 from .utils.telegram_notify import send_telegram_message
 
 class Orchestrator:
-    def __init__(self, session, ticker_list):
+    def __init__(self, session, ticker_list, db_path="data/trade_bot.db", is_backtest=False, start_time=None, params=None):
         self.session = session
-        self.db = DatabaseManager()
+        self.db = DatabaseManager(db_path)
         self.all_tickers = ticker_list
         self.ws = None 
+        self.is_backtest = is_backtest
+        self._sim_time = start_time 
+        self.params = params or {} 
+        self.lock = asyncio.Lock()
+        self.semaphore = asyncio.Semaphore(5)
+        self.last_http = {}
 
-        # --- НАСТРОЙКИ ТАЙМИНГА ---
         last_reset = self.db.get_last_reset_time()
-        if last_reset:
-            self.cycle_start_time = last_reset
-            logger.info(f"📅 Цикл подхвачен из базы. Начало: {self.cycle_start_time}")
-        else:
-            self.cycle_start_time = datetime.utcnow()
+        self.cycle_start_time = start_time if is_backtest else (last_reset or self.get_now())
+        if not is_backtest and not last_reset:
             self.db.save_reset_time(self.cycle_start_time)
-            logger.info(f"🆕 Начало первого цикла: {self.cycle_start_time}")
 
         self.cycle_duration_hours = 24  
-        
-        # --- СОСТОЯНИЕ ТОРГОВЛИ ---
-        self.live_trading_blocked = False  
-        
-        # --- РИСКИ И ЛИМИТЫ (Оптимизировано под $68) ---
+        self.active_portfolio = {}      
+        self.market_sentiment = 0       
+        self.live_trading_blocked = False
         self.initial_virtual_deposit = 68.0
-        self.risk_per_trade = 0.02      # Риск 2%
+        self.risk_per_trade = 0.02      
         self.max_leverage = 3    
-        self.max_order_usd_limit = 40.0  # <--- НОВЫЙ ЖЕСТКИЙ ЛИМИТ $40       # Плечо 3х
-        self.slots_per_paper_strategy = 5 
-        self.max_live_slots_total = 5   # 5 слота (диверсификация)
-        
-        # --- ФИЛЬТРЫ РЫНКА ---
-        self.min_volume_24h = 20_000_000 
+        self.max_order_usd_limit = 40.0 
+        self.max_live_slots_total = 5   
         self.timeframes = ["15", "60"]
-        self.warmup_hours = 24
-
-        # Сразу определяем лидера при запуске
         self.select_best_strategy_extended()
 
-    # --- МЕТОДЫ API BYBIT ---
+    def get_now(self):
+        dt = self._sim_time if self.is_backtest and self._sim_time else datetime.now(timezone.utc)
+        return dt.replace(tzinfo=None) if hasattr(dt, 'tzinfo') and dt.tzinfo else dt
+
+    def set_sim_time(self, new_time):
+        self._sim_time = new_time.replace(tzinfo=None) if new_time and hasattr(new_time, 'tzinfo') else new_time
+
+    def format_step(self, value, step):
+        return float(Decimal(str(value)).quantize(Decimal(str(step)), rounding=ROUND_DOWN))
 
     def get_balances(self):
-        """Получает баланс с защитой от пустых строк и лагов маржи"""
+        if self.is_backtest: return {'equity': 1000.0, 'available': 1000.0}
         try:
             res = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-            if res['retCode'] != 0: return {'equity': self.initial_virtual_deposit, 'available': 0.0}
-
-            account_data = res['result']['list'][0]
-            
-            def to_f(val, default=0.0):
-                if val is None or str(val).strip() == "": return default
-                try: return float(val)
-                except: return default
-
-            equity = to_f(account_data.get('totalEquity'), self.initial_virtual_deposit)
+            acc = res['result']['list'][0]
+            equity = float(acc.get('totalEquity', self.initial_virtual_deposit) or self.initial_virtual_deposit)
             available = 0.0
-            for c in account_data.get('coin', []):
-                if c.get('coin') == 'USDT':
-                    available = to_f(c.get('availableToWithdraw'))
-                    if available == 0: available = to_f(c.get('equity'))
+            for c in acc.get('coin', []):
+                if c['coin'] == 'USDT':
+                    available = float(c.get('availableToWithdraw', 0) or 0)
                     break
-            
-            # Если позиция открыта на всё, available может быть 0
             return {'equity': equity, 'available': available}
-        except:
-            return {'equity': self.initial_virtual_deposit, 'available': 0.0}
+        except: return {'equity': self.initial_virtual_deposit, 'available': 0.0}
 
-    def get_market_tickers(self):
-        try:
-            response = self.session.get_tickers(category="linear")
-            tickers_data = response.get('result', {}).get('list', [])
-            blacklist = ['AVNTUSDT'] 
-            return [t['symbol'] for t in tickers_data 
-                    if float(t['turnover24h']) >= self.min_volume_24h 
-                    and t['symbol'].endswith('USDT') 
-                    and t['symbol'] not in blacklist]
-        except: return self.all_tickers
+    def calculate_position_size(self, entry, sl):
+        bal = self.get_balances()
+        risk_usd = bal['equity'] * self.risk_per_trade
+        dist = abs(entry - sl) / entry
+        if dist < 0.001: return 0
+        ideal = risk_usd / dist
+        max_margin = (bal['equity'] / self.max_live_slots_total) * self.max_leverage
+        return round(min(ideal, max_margin, self.max_order_usd_limit), 2)
 
-    def get_symbol_info(self, symbol):
-        try:
-            res = self.session.get_instruments_info(category="linear", symbol=symbol)
-            info = res['result']['list'][0]
-            return {
-                'qty_step': float(info['lotSizeFilter']['qtyStep']),
-                'price_step': float(info['priceFilter']['tickSize']),
-                'min_qty': float(info['lotSizeFilter']['minOrderQty'])
-            }
-        except: return None
+    def select_best_strategy_extended(self):
+        all_strats = [f"{n}_{tf}" for tf in self.timeframes for n in ['breakout', 'bounce', 'trend', 'fakeout']]
+        pf_min = self.params.get('pf_min', 1.3)
+        scored_strats = []
+        for hours in [12, 24, 48]:
+            scored_strats = []
+            for s in all_strats:
+                stats = self.db.get_detailed_stats(s, hours=hours, current_time=self.get_now())
+                if stats['count'] >= 3 and stats['pf'] >= pf_min and stats['pnl'] > 0:
+                    scored_strats.append({'name': s, 'score': stats['pnl'] * stats['pf'] * (stats['wr'] / 100)})
+            if len(scored_strats) >= 2: break
+        scored_strats.sort(key=lambda x: x['score'], reverse=True)
+        self.active_portfolio = {}
+        if len(scored_strats) >= 1: self.active_portfolio[scored_strats[0]['name']] = 3
+        if len(scored_strats) >= 2: self.active_portfolio[scored_strats[1]['name']] = 1
+        if len(scored_strats) >= 3: self.active_portfolio[scored_strats[2]['name']] = 1
+        if self.active_portfolio: logger.info(f"💼 ПОРТФЕЛЬ: {self.active_portfolio}")
 
-    def set_leverage(self, symbol, leverage):
+    def get_market_sentiment(self):
         try:
-            self.session.set_leverage(category="linear", symbol=symbol, 
-                                     buyLeverage=str(leverage), sellLeverage=str(leverage))
+            res = self.session.get_kline(category="linear", symbol="BTCUSDT", interval="60", limit=60)
+            klines = res.get('result', {}).get('list', [])
+            if not klines: return 0
+            closes = [float(k[4]) for k in klines[::-1]]
+            sma = sum(closes[-50:]) / 50
+            return 1 if closes[-1] > sma * 1.0002 else (-1 if closes[-1] < sma * 0.9998 else 0)
+        except: return 0
+
+    async def run_parallel_scan(self):
+        now = self.get_now()
+        if (now - self.cycle_start_time).total_seconds() > self.cycle_duration_hours * 3600:
+            async with self.lock:
+                self.select_best_strategy_extended()
+                self.cycle_start_time = now
+                self.db.save_reset_time(now)
+                self.live_trading_blocked = False
+
+        if not self.live_trading_blocked:
+            daily_pnl = await asyncio.to_thread(self.db.get_live_daily_pnl, self.cycle_start_time)
+            if daily_pnl <= -5.0:
+                self.live_trading_blocked = True
+                send_telegram_message(f"🚨 <b>LIVE STOP</b>: Убыток за день ${daily_pnl:.2f}.")
+
+        self.market_sentiment = await asyncio.to_thread(self.get_market_sentiment)
+        current_tickers = await asyncio.to_thread(self.get_market_tickers)
+        strategy_map = {'breakout': BreakoutStrategy, 'fakeout': FakeoutStrategy, 'bounce': BounceStrategy, 'trend': TrendStrategy}
+        tasks = [self._throttled_scan(t, strategy_map) for t in current_tickers]
+        await asyncio.gather(*tasks)
+        logger.info(f"✅ Скан завершен в {now.strftime('%H:%M:%S')}")
+
+    async def _throttled_scan(self, ticker, strategy_map):
+        async with self.semaphore:
+            await asyncio.sleep(0.1) 
+            for tf in self.timeframes: await self.process_ticker_tf(ticker, tf, strategy_map)
+
+    async def process_ticker_tf(self, ticker, tf, strategy_map):
+        if self.db.is_ticker_in_cooldown(ticker, current_time=self.get_now()): return
+        for name, StratClass in strategy_map.items():
+            full_name = f"{name}_{tf}"
+            if await asyncio.to_thread(self.db.has_recent_trade, ticker, full_name, 15): continue
+            obj = StratClass(self.session, ticker, tf, self.db, is_backtest=self.is_backtest, params=self.params)
+            signal = await asyncio.to_thread(obj.check_signal)
+            if signal:
+                async with self.lock:
+                    if not self.db.has_recent_trade(ticker, full_name, 1):
+                        await asyncio.to_thread(self.handle_signal_logic, ticker, full_name, signal)
+
+    def handle_signal_logic(self, ticker, full_name, signal):
+        amount = self.calculate_position_size(signal['entry'], signal['sl'])
+        if amount <= 0: return
+        self.db.add_trade(ticker, full_name, 'paper', signal['signal'], signal['entry'], signal['sl'], signal['tp'], signal.get('atr', 0), amount, current_time=self.get_now())
+        if full_name in self.active_portfolio and not self.live_trading_blocked:
+            if ticker != "BTCUSDT":
+                if self.market_sentiment == 1 and signal['signal'] == 'short': return
+                if self.market_sentiment == -1 and signal['signal'] == 'long': return
+            if self.db.get_active_trades_count('live') < self.max_live_slots_total:
+                if self.db.get_active_count_by_strategy(full_name, 'live') < self.active_portfolio[full_name]:
+                    if not self.db.has_open_trade(ticker, None, 'live'):
+                        if self.place_live_order(ticker, signal['signal'], signal['entry'], signal['sl'], signal['tp'], amount):
+                            self.db.add_trade(ticker, full_name, 'live', signal['signal'], signal['entry'], signal['sl'], signal['tp'], signal.get('atr', 0), amount, current_time=self.get_now())
+                            logger.info(f"🔥 LIVE OPEN: {ticker} ({full_name})")
+                            send_telegram_message(f"🚀 <b>LIVE ВХОД</b>\n{ticker} ({full_name})\n{signal['signal'].upper()}")
+
+    def update_open_trades_ws(self):
+        session_db = self.db.Session()
+        try:
+            open_trades = session_db.query(self.db.Trade).filter(self.db.Trade.status == 'open').all()
+            now = self.get_now()
+            for trade in open_trades:
+                price = self.ws.get_last_price(trade.ticker) if self.ws else None
+                if price is None:
+                    last_req = self.last_http.get(trade.ticker, 0)
+                    if time.time() - last_req > 30:
+                        try:
+                            res = self.session.get_tickers(category="linear", symbol=trade.ticker)
+                            price = float(res['result']['list'][0]['lastPrice'])
+                            self.last_http[trade.ticker] = time.time()
+                            logger.debug(f"🔄 Цена {trade.ticker} получена через HTTP")
+                        except: continue
+                    else: continue
+                if not trade.is_breakeven and trade.atr_at_entry and trade.atr_at_entry > 0:
+                    trigger = trade.atr_at_entry * 2.0
+                    if (trade.side == 'long' and price >= (trade.entry_price + trigger)) or (trade.side == 'short' and price <= (trade.entry_price - trigger)):
+                        trade.stop_loss, trade.is_breakeven = trade.entry_price, True
+                        if trade.trade_type == 'live' and not self.is_backtest: self.modify_live_stop_loss(trade.ticker, trade.entry_price)
+                ttl = 8 if "15" in trade.strategy_name else 24
+                if (now - trade.created_at.replace(tzinfo=None)).total_seconds() > ttl * 3600:
+                    self.close_and_notify(trade, price, "TTL Exit")
+                    continue
+                is_closed = False
+                if trade.side == 'long':
+                    if price >= trade.take_profit or price <= trade.stop_loss: is_closed = True
+                else:
+                    if price <= trade.take_profit or price >= trade.stop_loss: is_closed = True
+                if is_closed: self.close_and_notify(trade, price, "Target/Stop")
+            session_db.commit()
+        except Exception as e: logger.error(f"WS Error: {e}")
+        finally: session_db.close()
+
+    def modify_live_stop_loss(self, ticker, new_sl):
+        try:
+            info = self.session.get_instruments_info(category="linear", symbol=ticker)['result']['list'][0]
+            sl_f = self.format_step(new_sl, info['priceFilter']['tickSize'])
+            self.session.set_trading_stop(category="linear", symbol=ticker, stopLoss=str(sl_f), slTriggerBy="LastPrice", tpslMode="Full")
         except: pass
 
     def place_live_order(self, ticker, side, entry, sl, tp, amount_usd):
-        """Выставление реального ордера. amount_usd — это номинал (уже с учетом плеча)"""
+        if self.is_backtest: return True
         try:
-            self.set_leverage(ticker, self.max_leverage)
-            info = self.get_symbol_info(ticker)
-            if not info: return False
-
-            # --- ИСПРАВЛЕННАЯ МАТЕМАТИКА QTY ---
-            # amount_usd уже включает в себя плечо из метода calculate_position_size
-            qty_raw = amount_usd / entry 
-            
-            qty = round(round(qty_raw / info['qty_step']) * info['qty_step'], 8)
-            if qty < info['min_qty']: 
-                logger.error(f"Qty {qty} ниже минималки {info['min_qty']}")
-                return False
-
-            sl = round(round(sl / info['price_step']) * info['price_step'], 8)
-            tp = round(round(tp / info['price_step']) * info['price_step'], 8)
-
+            info = self.session.get_instruments_info(category="linear", symbol=ticker)['result']['list'][0]
+            qty = self.format_step(amount_usd / entry, info['lotSizeFilter']['qtyStep'])
+            if qty < float(info['lotSizeFilter']['minOrderQty']): return False
+            try: self.session.set_leverage(category="linear", symbol=ticker, buyLeverage=str(self.max_leverage), sellLeverage=str(self.max_leverage))
+            except: pass
             res = self.session.place_order(
                 category="linear", symbol=ticker, side="Buy" if side == "long" else "Sell",
-                orderType="Market", qty=str(qty), takeProfit=str(tp), stopLoss=str(sl),
-                tpOrderType="Market", slOrderType="Market", tpslMode="Full", isLeverage=1
+                orderType="Market", qty=str(qty), takeProfit=str(self.format_step(tp, info['priceFilter']['tickSize'])),
+                stopLoss=str(self.format_step(sl, info['priceFilter']['tickSize'])), tpslMode="Full", isLeverage=1
             )
-            if res['retCode'] == 0:
-                logger.success(f"🚀 ОРДЕР ИСПОЛНЕН: {ticker}")
-                return True
-            else:
-                logger.error(f"❌ Bybit Error {ticker}: {res['retMsg']}")
-                send_telegram_message(f"❌ <b>ОШИБКА ОРДЕРА {ticker}</b>\n{res['retMsg']}")
-                return False
-        except Exception as e:
-            logger.error(f"Ошибка метода ордера: {e}")
-            return False
+            return res['retCode'] == 0
+        except Exception as e: return False
 
-    # --- ЛОГИКА ТОРГОВЛИ ---
+    def close_and_notify(self, trade, price, reason):
+        if trade.trade_type == 'live' and not self.is_backtest: self.close_live_position(trade.ticker, trade.side)
+        pnl = self.calculate_pnl_simple(trade, price)
+        self.db.close_trade(trade.id, price, pnl, current_time=self.get_now())
+        if trade.trade_type == 'live':
+            icon = "💰" if pnl > 0 else "📉"
+            send_telegram_message(f"{icon} <b>LIVE ЗАКРЫТ</b>\n{trade.ticker}\nPnL: ${pnl:+.2f}\n{reason}")
+        logger.info(f"✅ CLOSED {trade.ticker} ({trade.trade_type}): {pnl}$ | {reason}")
 
     def calculate_pnl_simple(self, trade, exit_price):
-        """Расчет PnL с вычетом комиссии 0.12% (вход + выход)"""
         diff = (exit_price - trade.entry_price) / trade.entry_price
         if trade.side == 'short': diff = -diff
-        
-        gross_pnl = diff * trade.amount_usd
-        # Комиссия Bybit (Taker) ~0.06% за открытие и 0.06% за закрытие = 0.12%
-        fee = trade.amount_usd * 0.0012
-        
-        return round(gross_pnl - fee, 4)
+        return round((diff * trade.amount_usd) - (trade.amount_usd * 0.0012), 4)
 
-    def calculate_position_size(self, entry, sl):
-        """Рассчитывает номинальный объем позиции с жестким лимитом $40"""
+    def get_market_tickers(self):
         try:
-            balances = self.get_balances()
-            equity = balances['equity']
-            available = balances['available'] if balances['available'] > 0 else 5.0 
-            
-            # 1. Расчет объема исходя из риска 2% (например, $1.36 при депо $68)
-            risk_usd = equity * self.risk_per_trade 
-            stop_dist = abs(entry - sl) / entry
-            if stop_dist < 0.001: return 0
-            
-            ideal_nominal = risk_usd / stop_dist 
-            
-            # 2. Лимит маржи (исходя из свободных денег на бирже)
-            free_slots = max(1, self.max_live_slots_total - self.db.get_active_trades_count('live'))
-            # Сколько маржи можно выделить на один слот (с учетом плеча 3х и запаса 10%)
-            max_nominal_by_margin = (available / free_slots) * self.max_leverage * 0.9
-            
-            # 3. Итоговый выбор (Самое МЕНЬШЕЕ из трех)
-            # - идеальный риск
-            # - физический предел кошелька
-            # - твой жесткий лимит $40
-            final_amount = min(ideal_nominal, max_nominal_by_margin, self.max_order_usd_limit)
-            
-            logger.info(f"Sizing: Риск {ideal_nominal:.1f}$, Маржа {max_nominal_by_margin:.1f}$, Лимит {self.max_order_usd_limit}$. Итог: {final_amount}$")
-            
-            return round(final_amount, 2)
-        except Exception as e:
-            logger.error(f"Ошибка в расчете сайзинга: {e}")
-            return 0
-
-    def check_cycle_reset(self):
-        """Проверка завершения 24-часового цикла с умным закрытием позиций"""
-        now = datetime.utcnow()
-        if now - self.cycle_start_time > timedelta(hours=self.cycle_duration_hours):
-            logger.warning("🏁 ЗАВЕРШЕНИЕ 24-ЧАСОВОГО ЦИКЛА. Анализируем смену лидера...")
-            
-            # Запоминаем старого лидера перед пересчетом
-            old_leader = self.active_strategy_name
-            
-            # 1. Подводим итоги (это обновит self.active_strategy_name)
-            self.select_best_strategy_extended()
-            new_leader = self.active_strategy_name
-            
-            # 2. Если лидер сменился — чистим портфель от "старых" стратегий
-            if new_leader != old_leader and old_leader is not None:
-                logger.info(f"🔄 Лидер изменился ({old_leader} -> {new_leader}). Закрываем прибыльные/нейтральные сделки.")
-                self.close_profitable_live_trades()
-            
-            # 3. Разблокируем торговлю и обновляем время
-            self.live_trading_blocked = False
-            self.cycle_start_time = now
-            self.db.save_reset_time(now)
-            
-            send_telegram_message(
-                f"📊 <b>НОВЫЙ ТОРГОВЫЙ ЦИКЛ (24ч)</b>\n"
-                f"🏆 Лидер: <code>{new_leader}</code>\n"
-                f"🛡️ LIVE: РАЗБЛОКИРОВАН"
-            )
-    def select_best_strategy_extended(self):
-        """Умный выбор лидера на основе Profit Factor и количества сделок"""
-        all_strats = [f"{n}_{tf}" for tf in self.timeframes for n in ['breakout', 'bounce', 'trend', 'fakeout']]
-        
-        best_name = None
-        max_score = -999999
-
-        for s in all_strats:
-            stats = self.db.get_detailed_stats(s, hours=24)
-            
-            # Логируем расширенную инфо
-            logger.info(f"📊 {s.ljust(12)} | PnL: {stats['pnl']:+.2f}$ | PF: {stats['pf']:.2f} | WR: {stats['wr']:.1f}% | Сделок: {stats['count']}")
-
-            # --- МАТЕМАТИЧЕСКИЙ СКОРИНГ ---
-            # Условия, чтобы стратегия считалась надежной:
-            # 1. Хотя бы 3 сделки за сутки
-            # 2. Profit Factor > 1.1 (зарабатывает больше, чем теряет)
-            # 3. PnL > 0
-            if stats['count'] >= 3 and stats['pf'] > 1.1 and stats['pnl'] > 0:
-                score = stats['pnl'] * stats['pf'] # Вес прибыли умножаем на фактор стабильности
-            else:
-                score = stats['pnl'] - 100 # Штраф за нестабильность
-
-            if score > max_score:
-                max_score = score
-                best_name = s
-
-        if best_name and max_score > 0:
-            self.active_strategy_name = best_name
-            logger.success(f"🏆 ТЕКУЩИЙ ЛИДЕР: {best_name}")
-        else:
-            self.active_strategy_name = None
-            logger.warning("⏸️ LIVE ПАУЗА: Надежных прибыльных стратегий не найдено.")
-
-    def update_open_trades_ws(self):
-        if not self.ws: return
-        session = self.db.Session()
-        open_trades = session.query(self.db.Trade).filter(self.db.Trade.status == 'open').all()
-        
-        for trade in open_trades:
-            try:
-                current_price = self.ws.get_last_price(trade.ticker)
-                if not current_price: continue
-
-                # 1. TTL (8ч для 15м, 24ч для 60м)
-                ttl = 8 if "15" in trade.strategy_name else 24
-                if datetime.utcnow() - trade.created_at > timedelta(hours=ttl):
-                    if trade.trade_type == 'live': self.close_live_position(trade.ticker, trade.side)
-                    pnl = self.calculate_pnl_simple(trade, current_price)
-                    self.db.close_trade(trade.id, current_price, pnl)
-                    send_telegram_message(f"⏰ <b>TTL ЗАКРЫТО: {trade.ticker}</b>\nPnL: ${pnl:.2f}")
-                    continue
-
-                # 2. Безубыток 2.5 ATR
-                if not trade.is_breakeven and trade.atr_at_entry:
-                    trigger = trade.atr_at_entry * 2.5
-                    if (trade.side == 'long' and current_price >= trade.entry_price + trigger) or \
-                       (trade.side == 'short' and current_price <= trade.entry_price - trigger):
-                        trade.stop_loss = trade.entry_price
-                        trade.is_breakeven = True
-                        logger.info(f"🛡️ {trade.ticker} -> BE")
-
-                # 3. Выход TP/SL
-                is_closed = False
-                exit_p = current_price
-                if trade.side == 'long':
-                    if current_price >= trade.take_profit: is_closed, exit_p = True, trade.take_profit
-                    elif current_price <= trade.stop_loss: is_closed, exit_p = True, trade.stop_loss
-                else:
-                    if current_price <= trade.take_profit: is_closed, exit_p = True, trade.take_profit
-                    elif current_price >= trade.stop_loss: is_closed, exit_p = True, trade.stop_loss
-
-                if is_closed:
-                    pnl = self.calculate_pnl_simple(trade, exit_p)
-                    self.db.close_trade(trade.id, exit_p, pnl)
-                    total_bal = self.get_balances()['equity']
-                    icon = "🔥 LIVE" if trade.trade_type == 'live' else "🧪 PAPER"
-                    logger.success(f"✅ {icon} {trade.ticker} закрыт. Баланс: ${total_bal:.2f}")
-                    send_telegram_message(f"✅ <b>{icon} ЗАКРЫТ</b>\n{trade.ticker}\nPnL: ${pnl:+.2f}")
-
-            except Exception as e: logger.error(f"WS Error: {e}")
-        session.commit()
-        session.close()
+            res = self.session.get_tickers(category="linear")
+            blacklist = ['DOLOUSDT', 'DEGENUSDT', 'DEFIUSDT', 'BUSDT', 'ARBUSDT', 'FILUSDT']
+            return [t['symbol'] for t in res['result']['list'] if t['symbol'].endswith('USDT') and float(t['turnover24h']) > 20_000_000 and t['symbol'] not in blacklist]
+        except: return self.all_tickers
 
     def close_live_position(self, ticker, side):
         try:
-            close_side = "Sell" if side == "long" else "Buy"
-            pos = self.session.get_positions(category="linear", symbol=ticker)
-            if pos['retCode'] == 0 and pos['result']['list']:
-                qty = pos['result']['list'][0]['size']
-                if float(qty) > 0:
-                    self.session.place_order(category="linear", symbol=ticker, side=close_side,
-                                             orderType="Market", qty=qty, reduceOnly=True, tpslMode="Full")
-                    return True
+            res = self.session.get_positions(category="linear", symbol=ticker)
+            pos = res.get('result', {}).get('list', [])
+            if pos and float(pos[0].get('size', 0)) > 0:
+                self.session.place_order(category="linear", symbol=ticker, side="Sell" if side=="long" else "Buy", orderType="Market", qty=pos[0]['size'], reduceOnly=True)
+                return True
             return False
         except: return False
-    def close_profitable_live_trades(self):
-        """Закрывает только те LIVE сделки, которые сейчас в плюсе или около нуля"""
-        session = self.db.Session()
-        open_live_trades = session.query(self.db.Trade).filter(
-            self.db.Trade.trade_type == 'live',
-            self.db.Trade.status == 'open'
-        ).all()
-
-        closed_count = 0
-        for trade in open_live_trades:
-            try:
-                current_price = self.ws.get_last_price(trade.ticker)
-                if not current_price: continue
-
-                pnl = self.calculate_pnl_simple(trade, current_price)
-                
-                # Условие: закрываем, если профит >= -0.1$ (почти ноль или плюс)
-                # Это позволяет выйти из сделки без существенного убытка при смене стратегии
-                if pnl >= -0.10:
-                    success = self.close_live_position(trade.ticker, trade.side)
-                    if success:
-                        self.db.close_trade(trade.id, current_price, pnl)
-                        closed_count += 1
-                        send_telegram_message(f"♻️ <b>Смена стратегии:</b> Закрыта нейтральная сделка {trade.ticker}\nPnL: ${pnl:.2f}")
-            
-            except Exception as e:
-                logger.error(f"Ошибка при ротации сделки {trade.ticker}: {e}")
-
-        session.close()
-        logger.info(f"Ротация завершена. Закрыто {closed_count} сделок.")
-
-    def run_cycle(self):
-        if self.ws: logger.info(f"Статус WS: {self.ws.get_status()}")
-        self.check_cycle_reset()
-        
-        if not self.live_trading_blocked and self.db.check_consecutive_live_losses(limit=3):
-            self.live_trading_blocked = True
-            send_telegram_message("🚨 <b>LIVE СТОП</b>: 3 убытка подряд.")
-
-        current_tickers = self.get_market_tickers()
-        
-        strategy_classes = [('breakout', BreakoutStrategy), ('fakeout', FakeoutStrategy), 
-                            ('bounce', BounceStrategy), ('trend', TrendStrategy)]
-
-        for ticker in current_tickers:
-            if self.db.is_ticker_in_cooldown(ticker): continue
-            time.sleep(0.2) 
-
-            for tf in self.timeframes:
-                sorted_strats = sorted(strategy_classes, key=lambda x: f"{x[0]}_{tf}" == self.active_strategy_name, reverse=True)
-
-                for name, StratClass in sorted_strats:
-                    full_name = f"{name}_{tf}"
-                    if self.db.has_open_trade(ticker, full_name, 'paper'): continue
-                    if self.db.get_active_count_by_strategy(full_name, 'paper') >= self.slots_per_paper_strategy: continue
-
-                    obj = StratClass(self.session, ticker, tf, self.db)
-                    signal = obj.check_signal()
-                    
-                    if signal:
-                        amount = self.calculate_position_size(signal['entry'], signal['sl'])
-                        if amount <= 0: continue
-
-                        # PAPER ENTRY
-                        self.db.add_trade(ticker, full_name, 'paper', signal['signal'], signal['entry'], 
-                                          signal['sl'], signal['tp'], signal.get('atr', 0), amount)
-                        
-                        side_icon = "🟢 LONG" if signal['signal'] == 'long' else "🔴 SHORT"
-                        msg = (f"🧪 <b>PAPER: {ticker}</b> ({full_name})\n🧭 {side_icon}\n💰 Вход: {signal['entry']}\n🛑 Стоп: {signal['sl']}\n🎯 Тейк: {signal['tp']}\n📊 Номинал: ${amount}")
-                        send_telegram_message(msg)
-
-                        # LIVE ENTRY
-                        if full_name == self.active_strategy_name and not self.live_trading_blocked:
-                            if self.db.get_active_trades_count('live') < self.max_live_slots_total:
-                                if not self.db.has_open_trade(ticker, None, 'live'):
-                                    if self.place_live_order(ticker, signal['signal'], signal['entry'], signal['sl'], signal['tp'], amount):
-                                        self.db.add_trade(ticker, full_name, 'live', signal['signal'], signal['entry'], 
-                                                          signal['sl'], signal['tp'], signal.get('atr', 0), amount)
-                                        send_telegram_message(f"🔥 <b>LIVE ВХОД ВЫПОЛНЕН: {ticker}</b>")
-
-        logger.info("--- Цикл завершен ---")

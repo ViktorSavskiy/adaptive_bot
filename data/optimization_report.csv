@@ -1,0 +1,11 @@
+Config,PnL ($),Trades,PF,Avg
+v9_GoldenRatio,17.2,164,1.38,0.105
+v5_EliteOnly,16.4,125,1.48,0.131
+v2_TrendFollower,13.56,197,1.25,0.069
+v7_Protective,10.93,153,1.25,0.071
+v8_Impulse,9.64,152,1.24,0.063
+v1_Conservative,9.62,177,1.19,0.054
+v10_HighFreq,5.15,270,1.07,0.019
+v4_Scalper,3.91,255,1.06,0.015
+v6_BreakoutMaster,1.06,207,1.02,0.005
+v3_Sniper,-0.82,140,0.98,-0.006

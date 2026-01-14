@@ -1,137 +1,184 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
-from scipy.stats import linregress
-from collections import defaultdict
+import time
+from loguru import logger
 
 class BaseStrategy(ABC):
-    def __init__(self, session, ticker, interval, db_manager):
+    # Статический кэш для предотвращения повторных расчетов внутри одного цикла сканирования
+    _analysis_cache = {}
+    _trend_cache = {} 
+    def __init__(self, session, ticker, interval, db_manager, is_backtest=False, params=None):
         self.session = session
         self.ticker = ticker
         self.interval = interval
         self.db = db_manager
+        self.is_backtest = is_backtest
+        self.params = params or {}
 
-    def get_data(self, limit=100):
+    def get_data(self, limit=200):
+        """
+        Получение данных. В Live-режиме всегда отрезает текущую незакрытую свечу
+        для полной синхронизации с логикой бэктеста.
+        """
+        # Ключ кэша: (тикер, интервал, метка времени)
+        # В Live кэш живет 1 минуту
+        now_mark = self.session.sim_time if self.is_backtest else int(time.time() // 60)
+        cache_key = (self.ticker, self.interval, now_mark)
+
+        if cache_key in BaseStrategy._analysis_cache:
+            return BaseStrategy._analysis_cache[cache_key]
+
         try:
+            # В Live запрашиваем на 1 свечу больше, чтобы отбросить "живую"
+            fetch_limit = limit + 1 if not self.is_backtest else limit
+            
             response = self.session.get_kline(
-                category="linear", symbol=self.ticker, interval=self.interval, limit=limit
+                category="linear", symbol=self.ticker, interval=self.interval, limit=fetch_limit
             )
             klines = response.get('result', {}).get('list', [])
-            if not klines: return pd.DataFrame()
-            df = pd.DataFrame(klines, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-            cols = ['open', 'high', 'low', 'close', 'volume', 'turnover']
-            df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
-            return df.iloc[::-1].reset_index(drop=True)
+            if not klines:
+                return pd.DataFrame()
+
+            # Формируем DataFrame
+            df = pd.DataFrame(klines, columns=['time_ms', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+            
+            # Быстрое приведение к числам
+            num_cols = ['open', 'high', 'low', 'close', 'volume']
+            df[num_cols] = df[num_cols].astype(float)
+            
+            # Переворачиваем в хронологию
+            df = df.iloc[::-1].reset_index(drop=True)
+
+            # ВАЖНО: В Live отсекаем последнюю (текущую) свечу
+            if not self.is_backtest:
+                df = df.iloc[:-1].reset_index(drop=True)
+
+            # Сохраняем в кэш
+            BaseStrategy._analysis_cache[cache_key] = df
+            
+            # Очистка старого кэша при раздувании
+            if len(BaseStrategy._analysis_cache) > 500:
+                BaseStrategy._analysis_cache.clear()
+
+            return df
         except Exception as e:
-            print(f"Ошибка данных {self.ticker}: {e}")
+            logger.error(f"Ошибка получения данных для {self.ticker}: {e}")
             return pd.DataFrame()
 
     def calculate_atr(self, df, period=14):
-        if len(df) < period + 1: return 0.0, 0.0
-        high, low, close = df['high'].values, df['low'].values, df['close'].values
-        tr = np.maximum(high[1:] - low[1:], np.maximum(abs(high[1:] - close[:-1]), abs(low[1:] - close[:-1])))
-        atr = np.mean(tr[-period:])
+        """Скоростной расчет ATR через NumPy"""
+        if len(df) < period + 1:
+            return 0.0, 0.0
+        
+        high = df['high'].values
+        low = df['low'].values
+        prev_close = df['close'].shift(1).values
+
+        tr = np.maximum(high - low, 
+                np.maximum(abs(high - prev_close), 
+                abs(low - prev_close)))
+        
+        atr = np.nanmean(tr[-period:])
         atr_pct = (atr / df['close'].iloc[-1]) * 100
         return float(atr), float(atr_pct)
 
-    def get_trend_strength(self, df, window=15):
-        if len(df) < window: return 0.0
-        prices = np.log(df['close'].tail(window).values)
-        slope, _, _, _, _ = linregress(np.arange(len(prices)), prices)
-        return slope * 100
+    def find_levels(self, df, window=7):
+        """Поиск фрактальных уровней ( window=7 оптимально для 15м/60м )"""
+        if len(df) < window * 2 + 1:
+            return [], []
+        
+        highs = df['high'].values
+        lows = df['low'].values
+        res_levels = []
+        sup_levels = []
 
-    def find_levels(self, df, window=10):
-        if len(df) < window * 2: return [], []
-        df['is_max'] = df['high'] == df['high'].rolling(window=window*2+1, center=True).max()
-        df['is_min'] = df['low'] == df['low'].rolling(window=window*2+1, center=True).min()
-        return df[df['is_max'] == True]['high'].tolist(), df[df['is_min'] == True]['low'].tolist()
+        for i in range(window, len(df) - window):
+            # Сопротивление
+            if all(highs[i] >= highs[i-window:i]) and all(highs[i] > highs[i+1:i+window+1]):
+                res_levels.append(highs[i])
+            # Поддержка
+            if all(lows[i] <= lows[i-window:i]) and all(lows[i] < lows[i+1:i+window+1]):
+                sup_levels.append(lows[i])
+        
+        return res_levels, sup_levels
 
     def cluster_levels(self, levels, atr_pct):
+        """Объединение близких уровней"""
         if not levels: return []
-        threshold = atr_pct / 100
-        clusters = defaultdict(list)
-        for level in sorted(levels):
-            found = False
-            for cluster_key in clusters:
-                if abs(level - cluster_key) < threshold * cluster_key:
-                    clusters[cluster_key].append(level)
-                    found = True
-                    break
-            if not found: clusters[level].append(level)
-        return [np.mean(v) for v in clusters.values()]
-
-    def get_htf_trend(self):
-        """
-        Определяет глобальный тренд на старшем таймфрейме (HTF).
-        15м -> смотрим 1ч (60).
-        60м -> смотрим 4ч (240).
-        """
-        htf_interval = "60" if self.interval == "15" else "240"
+        threshold = (atr_pct / 100) * 0.7 
+        sorted_lvls = sorted(levels)
+        clusters = []
+        if not sorted_lvls: return []
         
-        try:
-            res = self.session.get_kline(
-                category="linear", 
-                symbol=self.ticker, 
-                interval=htf_interval, 
-                limit=210
-            )
-            
-            klines = res.get('result', {}).get('list', [])
-            if len(klines) < 200: 
-                return 0
-
-            # Создаем DataFrame с именованными колонками для надежности
-            df_htf = pd.DataFrame(klines, columns=['time', 'open', 'high', 'low', 'close', 'vol', 'turnover'])
-            
-            # Преобразуем цены закрытия (индекс 4 в списке Bybit) в числа
-            close_prices = pd.to_numeric(df_htf['close']).iloc[::-1] # Переворот в хронологию
-
-            # Расчет EMA 200
-            ema200_series = close_prices.ewm(span=200, adjust=False).mean()
-            last_ema = ema200_series.iloc[-1]
-            current_price = close_prices.iloc[-1]
-
-            return 1 if current_price > last_ema else -1
-            
-        except Exception as e:
-            # Если биржа не ответила или данные битые — возвращаем 0 (нейтрально)
-            # logger.warning(f"Ошибка HTF тренда для {self.ticker}: {e}")
-            return 0
-
-    # --- НОВЫЕ МЕТОДЫ ДЛЯ ТВОЕЙ ЛОГИКИ ПРОБОЯ ---
-
-    def analyze_touches(self, df, level, level_type, atr_pct):
-        """Считает количество касаний уровня (твоя логика)"""
-        threshold = level * (atr_pct / 100) * 0.5 # Зона касания 50% от ATR
-        if level_type == 'resistance':
-            touches = df[(df['high'] >= level - threshold) & (df['high'] <= level + threshold)]
-        else:
-            touches = df[(df['low'] >= level - threshold) & (df['low'] <= level + threshold)]
-        return len(touches)
-
-    def is_price_near(self, current_p, level_p, tolerance=0.002):
-        """Проверка близости цены к уровню (0.2%)"""
-        return level_p * (1 - tolerance) <= current_p <= level_p * (1 + tolerance)
+        current_cluster = [sorted_lvls[0]]
+        for i in range(1, len(sorted_lvls)):
+            avg = np.mean(current_cluster)
+            if (sorted_lvls[i] - avg) / avg < threshold:
+                current_cluster.append(sorted_lvls[i])
+            else:
+                clusters.append(np.mean(current_cluster))
+                current_cluster = [sorted_lvls[i]]
+        clusters.append(np.mean(current_cluster))
+        return clusters
 
     def analyze_volume_spike(self, df, multiplier=1.3):
-        """Проверка всплеска объема"""
-        avg_vol = df['volume'].tail(20).mean()
-        return df['volume'].iloc[-1] > avg_vol * multiplier
+        """Проверка всплеска объема относительно среднего"""
+        if len(df) < 21: return False
+        avg_vol = df['volume'].iloc[-21:-1].mean()
+        return df['volume'].iloc[-1] > (avg_vol * multiplier)
+
+    def get_htf_trend(self):
+        """Определение тренда с кэшированием на 10 минут"""
+        now_ts = time.time()
+        cache_key = (self.ticker, self.interval)
+        
+        # Если в кэше есть свежий тренд (младше 10 минут) - берем его
+        if not self.is_backtest and cache_key in BaseStrategy._trend_cache:
+            ts, val = BaseStrategy._trend_cache[cache_key]
+            if now_ts - ts < 600: # 600 секунд = 10 минут
+                return val
+
+        # Если нет - делаем запрос (твой старый код)
+        htf_interval = "60" if self.interval == "15" else "240"
+        old_interval = self.interval
+        self.interval = htf_interval
+        df_htf = self.get_data(limit=250)
+        self.interval = old_interval
+        
+        res = 0
+        if not df_htf.empty and len(df_htf) >= 200:
+            ema200 = df_htf['close'].ewm(span=200, adjust=False).mean().iloc[-1]
+            current = df_htf['close'].iloc[-1]
+            if current > ema200 * 1.0002: res = 1
+            elif current < ema200 * 0.9998: res = -1
+
+        # Сохраняем в кэш
+        if not self.is_backtest:
+            BaseStrategy._trend_cache[cache_key] = (now_ts, res)
+        
+        return res
 
     def check_level_quality(self, df, level, level_type, atr_pct):
-        """Для отскока: проверка что уровень не 'прошит' телами"""
-        tolerance = level * (atr_pct / 100) * 0.2
-        touches, breaks = 0, 0
+        """Проверка надежности уровня по всей истории DataFrame"""
+        zone = level * (atr_pct / 100) * 0.4
+        touches = 0
+        violations = 0 
+        
         for i in range(len(df)):
-            high, low = df['high'].iloc[i], df['low'].iloc[i]
-            b_max, b_min = max(df['open'].iloc[i], df['close'].iloc[i]), min(df['open'].iloc[i], df['close'].iloc[i])
+            low, high = df['low'].iloc[i], df['high'].iloc[i]
+            body_max = max(df['open'].iloc[i], df['close'].iloc[i])
+            body_min = min(df['open'].iloc[i], df['close'].iloc[i])
+            
             if level_type == 'resistance':
-                if abs(high - level) <= tolerance: touches += 1
-                if b_max > level + tolerance: breaks += 1
+                if high >= level - zone and high <= level + zone: touches += 1
+                if body_max > level + zone: violations += 1
             else:
-                if abs(low - level) <= tolerance: touches += 1
-                if b_min < level - tolerance: breaks += 1
-        return touches >= 2 and (breaks == 0 or (touches / breaks) >= 3)
+                if low >= level - zone and low <= level + zone: touches += 1
+                if body_min < level - zone: violations += 1
+        
+        # Уровень годен, если было хоть одно подтверждающее касание
+        return touches >= 1 and (violations <= touches)
 
     @abstractmethod
     def check_signal(self):
